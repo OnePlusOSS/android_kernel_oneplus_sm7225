@@ -1,0 +1,3 @@
+
+#source "drivers/oneplus/input/touchscreen/Focal/FT8006/Kconfig"
+source "drivers/oneplus/input/touchscreen/Focal/ft3518/Kconfig"

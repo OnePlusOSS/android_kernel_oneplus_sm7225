@@ -1,0 +1,27 @@
+OnePlus NORD CE Oxygen OS 11.0.5.5EB13AA :
+
+If you build using aosp commands, before setting up environment 
+
+In "android/vendor/qcom/proprietary/prebuilt_grease/vendorsetup.sh" 
+comment out below line as shown((echo is added to display message))
+
+if [ -e "$dest" ];then
++echo "*****dont restore/delete symlink*******"
++#rm -rf $dest
+fi
+
+and add below in "android/build/core/main.mk" to build boot and dtbo together
+
+PHONY: bootimage
+bootimage: $(INSTALLED_BOOTIMAGE_TARGET) \
++           $(INSTALLED_DTBOIMAGE_TARGET)
+
+then do
+
+1. source build/envsetup.sh
+
+2. lunch (choose option 29 lito-userdebug)
+
+3. ./build.sh target_only bootimage
+
+

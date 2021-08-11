@@ -27,6 +27,7 @@
 #include "kgsl_reclaim.h"
 #include "kgsl_sync.h"
 #include "kgsl_trace.h"
+#include <linux/mm_types.h>
 
 #ifndef arch_mmap_check
 #define arch_mmap_check(addr, len, flags)	(0)
@@ -2402,14 +2403,6 @@ long kgsl_ioctl_cmdstream_freememontimestamp_ctxtid(
 	return ret;
 }
 
-static inline int _check_region(unsigned long start, unsigned long size,
-				uint64_t len)
-{
-	uint64_t end = ((uint64_t) start) + size;
-
-	return (end > len);
-}
-
 static int check_vma_flags(struct vm_area_struct *vma,
 		unsigned int flags)
 {
@@ -2424,23 +2417,27 @@ static int check_vma_flags(struct vm_area_struct *vma,
 	return -EFAULT;
 }
 
-static int check_vma(struct vm_area_struct *vma, struct file *vmfile,
-		struct kgsl_memdesc *memdesc)
+static int check_vma(unsigned long hostptr, u64 size)
 {
-	if (vma == NULL || vma->vm_file != vmfile)
-		return -EINVAL;
+	struct vm_area_struct *vma;
+	unsigned long cur = hostptr;
 
-	/* userspace may not know the size, in which case use the whole vma */
-	if (memdesc->size == 0)
-		memdesc->size = vma->vm_end - vma->vm_start;
-	/* range checking */
-	if (vma->vm_start != memdesc->useraddr ||
-		(memdesc->useraddr + memdesc->size) != vma->vm_end)
-		return -EINVAL;
-	return check_vma_flags(vma, memdesc->flags);
+	while (cur < (hostptr + size)) {
+		vma = find_vma(current->mm, cur);
+		if (!vma)
+			return false;
+
+		/* Don't remap memory that we already own */
+		if (vma->vm_file && vma->vm_file->f_op == &kgsl_fops)
+			return false;
+
+		cur = vma->vm_end;
+	}
+
+	return true;
 }
 
-static int memdesc_sg_virt(struct kgsl_memdesc *memdesc, struct file *vmfile)
+static int memdesc_sg_virt(struct kgsl_memdesc *memdesc)
 {
 	int ret = 0;
 	long npages = 0, i;
@@ -2463,18 +2460,16 @@ static int memdesc_sg_virt(struct kgsl_memdesc *memdesc, struct file *vmfile)
 	}
 
 	down_read(&current->mm->mmap_sem);
-	/* If we have vmfile, make sure we map the correct vma and map it all */
-	if (vmfile != NULL)
-		ret = check_vma(find_vma(current->mm, memdesc->useraddr),
-				vmfile, memdesc);
-
-	if (ret == 0) {
-		npages = get_user_pages(memdesc->useraddr,
-					sglen, write, pages, NULL);
-		ret = (npages < 0) ? (int)npages : 0;
+	if (!check_vma(memdesc->useraddr, memdesc->size)) {
+		up_read(&current->mm->mmap_sem);
+		ret = -EFAULT;
+		goto out;
 	}
+
+	npages = get_user_pages(memdesc->useraddr, sglen, write, pages, NULL);
 	up_read(&current->mm->mmap_sem);
 
+	ret = (npages < 0) ? (int)npages : 0;
 	if (ret)
 		goto out;
 
@@ -2525,7 +2520,7 @@ static int kgsl_setup_anon_useraddr(struct kgsl_pagetable *pagetable,
 		entry->memdesc.gpuaddr = (uint64_t)  entry->memdesc.useraddr;
 	}
 
-	return memdesc_sg_virt(&entry->memdesc, NULL);
+	return memdesc_sg_virt(&entry->memdesc);
 }
 
 #ifdef CONFIG_DMA_SHARED_BUFFER
@@ -4733,6 +4728,7 @@ static unsigned long _get_svm_area(struct kgsl_process_private *private,
 	uint64_t align;
 	unsigned long result;
 	unsigned long addr;
+	uint64_t svm_start, svm_end;
 
 	if (align_shift >= ilog2(SZ_2M))
 		align = SZ_2M;
@@ -4749,6 +4745,9 @@ static unsigned long _get_svm_area(struct kgsl_process_private *private,
 	if (kgsl_mmu_svm_range(private->pagetable, &start, &end,
 				entry->memdesc.flags))
 		return -ERANGE;
+
+	svm_start = start;
+	svm_end = end;
 
 	/* now clamp the range based on the CPU's requirements */
 	start = max_t(uint64_t, start, mmap_min_addr);
@@ -4791,12 +4790,57 @@ static unsigned long _get_svm_area(struct kgsl_process_private *private,
 	 * Search downwards from the hint first. If that fails we
 	 * must try to search above it.
 	 */
+	if (current->mm->va_feature & 0x2) {
+		uint64_t lstart, lend;
+		unsigned long lresult;
+
+		switch (len) {
+		case 4096: case 8192: case 16384: case 32768:
+		case 65536: case 131072: case 262144:
+			lend = current->mm->va_feature_rnd - (dbg_pm[2] * (ilog2(len) - dbg_pm[1]));
+			lstart = current->mm->va_feature_rnd - (dbg_pm[2] * dbg_pm[3]);
+			if (lend <= svm_end && lstart >= svm_start) {
+				lresult = _search_range(private, entry, lstart, lend, len, align);
+				if (!IS_ERR_VALUE(lresult))
+					return lresult;
+			}
+		default:
+			break;
+		}
+	}
 	result = _search_range(private, entry, start, addr, len, align);
 	if (IS_ERR_VALUE(result) && hint != 0)
 		result = _search_range(private, entry, addr, end, len, align);
 
 	return result;
 }
+
+static void kgsl_send_uevent_notify(struct kgsl_device *desc, char *comm,
+			unsigned long len, unsigned long total_vm,
+			unsigned long largest_gap_cpu, unsigned long largest_gap_gpu)
+{
+	char *envp[7];
+	char *title = "GPU_VM";
+
+	if (!desc)
+		return;
+	envp[0] = kasprintf(GFP_KERNEL, "title=%s", title);
+	envp[1] = kasprintf(GFP_KERNEL, "COMM=%s", comm);
+	envp[2] = kasprintf(GFP_KERNEL, "LEN=%lu", len);
+	envp[3] = kasprintf(GFP_KERNEL, "TOTAL_VM=%lu", total_vm);
+	envp[4] = kasprintf(GFP_KERNEL, "LARGEST_GAP_CPU=%lu", largest_gap_cpu);
+	envp[5] = kasprintf(GFP_KERNEL, "LARGEST_GAP_GPU=%lu", largest_gap_gpu);
+	envp[6] = NULL;
+	kobject_uevent_env(&desc->dev->kobj, KOBJ_CHANGE, envp);
+	kfree(envp[0]);
+	kfree(envp[1]);
+	kfree(envp[2]);
+	kfree(envp[3]);
+	kfree(envp[4]);
+	kfree(envp[5]);
+}
+
+static int current_pid = -1;
 
 static unsigned long
 kgsl_get_unmapped_area(struct file *file, unsigned long addr,
@@ -4832,12 +4876,35 @@ kgsl_get_unmapped_area(struct file *file, unsigned long addr,
 					       (int) val);
 	} else {
 		val = _get_svm_area(private, entry, addr, len, flags);
-		if (IS_ERR_VALUE(val))
+		if (IS_ERR_VALUE(val)) {
+			struct vm_area_struct *vma;
+			struct mm_struct *mm = current->mm;
+			unsigned long largest_gap_cpu = UINT_MAX;
+			unsigned long largest_gap_gpu = UINT_MAX;
+
 			dev_err_ratelimited(device->dev,
 					       "_get_svm_area: pid %d mmap_base %lx addr %lx pgoff %lx len %ld failed error %d\n",
 					       private->pid,
 					       current->mm->mmap_base, addr,
 					       pgoff, len, (int) val);
+
+			if (!RB_EMPTY_ROOT(&mm->mm_rb)) {
+				vma = rb_entry(mm->mm_rb.rb_node, struct vm_area_struct, vm_rb);
+				largest_gap_cpu = vma->rb_subtree_gap;
+				largest_gap_gpu = vma->rb_glfragment_gap;
+			}
+
+			if (private->pid != current_pid) {
+				current_pid = private->pid;
+				kgsl_send_uevent_notify(device, current->group_leader->comm,
+					len, mm->total_vm, largest_gap_cpu, largest_gap_gpu);
+			}
+
+			dev_err_ratelimited(device->dev,
+				"kgsl additional info: %s VmSize %lu MaxGapCpu %lu MaxGapGpu %lu VA_rnd 0x%llx\n"
+				, current->group_leader->comm, mm->total_vm, largest_gap_cpu
+				, largest_gap_gpu, mm->va_feature_rnd);
+		}
 	}
 
 put:

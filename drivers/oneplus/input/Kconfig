@@ -1,0 +1,11 @@
+# oem device deriver
+source "drivers/oneplus/input/touchscreen/Kconfig"
+source "drivers/oneplus/input/fingerprint/Kconfig"
+
+config TOUCHPANEL_ONEPLUS
+	default n
+	bool "Enable/Disable the touchscreen common driver"
+
+config OP_HIMAX
+       default n
+       bool "Enable/Disable the touchscreen_himax driver"

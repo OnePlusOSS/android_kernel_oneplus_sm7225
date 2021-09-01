@@ -25,3 +25,6 @@ then do
 3. ./build.sh target_only bootimage
 
 
+Synchronize codes for OnePlus NORD CE Oxygen OS 11.0.6.6EB13BA
+=======================
+- Kernel has no update -

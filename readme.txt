@@ -28,3 +28,15 @@ then do
 Synchronize codes for OnePlus NORD CE Oxygen OS 11.0.6.6EB13BA
 =======================
 - Kernel has no update -
+
+
+Synchronize codes for OnePlus NORD CE Oxygen OS 11.0.12.12EB13DA
+=======================
+---- Kernel update ----
+
+1. Submit the Google security patch CVE-2021-30306 for 2021-10
+
+2. Fix ->session locking
+
+3. fix a kernel-infoleak in qrtr_recvmsg()
+

@@ -40,3 +40,14 @@ Synchronize codes for OnePlus NORD CE Oxygen OS 11.0.12.12EB13DA
 
 3. fix a kernel-infoleak in qrtr_recvmsg()
 
+
+Synchronize codes for OnePlus NORD CE Oxygen OS 11.0.14.14EB13BA
+=======================
+---- Kernel update ----
+
+1. Submit the Google security patch for 2021-12
+
+2. Submit the Google security patch for 2022-01
+
+
+
